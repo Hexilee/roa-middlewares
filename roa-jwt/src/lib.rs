@@ -1,97 +1,64 @@
-use jsonwebtoken::{dangerous_unsafe_decode, decode, Validation};
-pub use jsonwebtoken::{encode, Algorithm, Header};
-use roa_core::{
-    Context, DynHandler, DynMiddleware, DynTargetHandler, Handler, Model, Next, Status, StatusCode,
-    StatusFuture, TargetHandler,
-};
+pub use async_trait::async_trait;
+pub use jsonwebtoken::Validation;
+
+use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+use http::HeaderValue;
+use jsonwebtoken::{dangerous_unsafe_decode, decode};
+use roa_core::{Context, Model, Next, Status, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
-use std::future::Future;
-use std::sync::Arc;
 
-pub struct JwtVerifier<M, C>
+const INVALID_HEADER_VALUE: &str = r#"Bearer realm="<jwt>", error="invalid_token""#;
+
+#[async_trait]
+pub trait JwtState<M, C>
 where
     M: Model,
     C: 'static + Serialize + DeserializeOwned,
 {
-    token_getter: Arc<DynHandler<M, String>>,
-    validation_getter: Arc<DynHandler<M, Validation>>,
-    secret_getter: Arc<DynTargetHandler<M, C, Vec<u8>>>,
-    claim_setter: Arc<DynTargetHandler<M, C>>,
+    async fn get_validation(&self) -> Validation;
+    async fn get_secret(&self, claim: &C) -> Result<Vec<u8>, Status>;
+    async fn set_claim(&mut self, claim: C);
 }
 
-impl<M, C> JwtVerifier<M, C>
-where
-    M: Model,
-    C: 'static + Serialize + DeserializeOwned,
-{
-    pub fn new<TG, TGF, SG, SGF>(token: TG, secret: SG) -> Self
-    where
-        TG: 'static + Send + Sync + Fn(Context<M>) -> TGF,
-        TGF: 'static + Send + Future<Output = Result<String, Status>>,
-        SG: 'static + Send + Sync + Fn(Context<M>, C) -> SGF,
-        SGF: 'static + Send + Future<Output = Result<Vec<u8>, Status>>,
-    {
-        Self {
-            token_getter: Arc::from(Box::new(token).dynamic()),
-            secret_getter: Arc::from(Box::new(secret).dynamic()),
-            validation_getter: Arc::from(
-                Box::new(|_ctx| async { Ok(Validation::default()) }).dynamic(),
-            ),
-            claim_setter: Arc::from(Box::new(|_ctx, _claim| async { Ok(()) }).dynamic()),
-        }
-    }
-
-    pub fn validation<VG, VGF>(&mut self, validation: VG) -> &mut Self
-    where
-        VG: 'static + Send + Sync + Fn(Context<M>) -> VGF,
-        VGF: 'static + Send + Future<Output = Result<Validation, Status>>,
-    {
-        self.validation_getter = Arc::from(Box::new(validation).dynamic());
-        self
-    }
+fn unauthorized_error<M: Model>(ctx: &mut Context<M>, www_authentication: &'static str) -> Status {
+    ctx.response.headers.insert(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_static(www_authentication),
+    );
+    Status::new(StatusCode::UNAUTHORIZED, "".to_string(), false)
 }
 
-impl<M, C> Clone for JwtVerifier<M, C>
-where
-    M: Model,
-    C: 'static + Serialize + DeserializeOwned,
-{
-    fn clone(&self) -> Self {
-        Self {
-            token_getter: self.token_getter.clone(),
-            validation_getter: self.validation_getter.clone(),
-            secret_getter: self.secret_getter.clone(),
-            claim_setter: self.claim_setter.clone(),
+fn try_get_token<M: Model>(ctx: Context<M>) -> Result<String, Status> {
+    match ctx.request.headers.get(AUTHORIZATION) {
+        None => Err(unauthorized_error(&mut ctx.clone(), INVALID_HEADER_VALUE)),
+        Some(value) => {
+            let token = value
+                .to_str()
+                .map_err(|_| unauthorized_error(&mut ctx.clone(), INVALID_HEADER_VALUE))?;
+            match token.find("Bearer") {
+                None => Err(unauthorized_error(&mut ctx.clone(), INVALID_HEADER_VALUE)),
+                Some(n) => Ok(token[n + 6..].trim().to_string()),
+            }
         }
     }
 }
 
-impl<M, C> TargetHandler<M, Next> for JwtVerifier<M, C>
+// TODO: test it
+pub async fn jwt_verify<M, C>(mut ctx: Context<M>, next: Next) -> Result<(), Status>
 where
     M: Model,
-    C: 'static + Serialize + DeserializeOwned + Send,
+    C: 'static + Serialize + DeserializeOwned,
+    M::State: JwtState<M, C>,
 {
-    type StatusFuture = StatusFuture;
-    fn handle(&self, ctx: Context<M>, next: Next) -> Self::StatusFuture {
-        let jwt = self.clone();
-        Box::pin(async move {
-            let token = (jwt.token_getter)(ctx.clone()).await?;
-            let dangerous_claim: C = dangerous_unsafe_decode(&token)
-                .map_err(|err| Status::new(StatusCode::BAD_REQUEST, err.to_string(), true))?
-                .claims;
-            let secret = (jwt.secret_getter)(ctx.clone(), dangerous_claim).await?;
-            let validation = (jwt.validation_getter)(ctx.clone()).await?;
-            let claim: C = decode(&token, &secret, &validation)
-                .map_err(|err| Status::new(StatusCode::FORBIDDEN, err.to_string(), true))?
-                .claims;
-            (jwt.claim_setter)(ctx, claim).await?;
-            next().await
-        })
-    }
-
-    fn dynamic(self: Box<Self>) -> Box<DynMiddleware<M>> {
-        Box::new(move |ctx, next| self.handle(ctx, next))
-    }
+    let token = try_get_token(ctx.clone())?;
+    let dangerous_claim: C = dangerous_unsafe_decode(&token)
+        .map_err(|_err| unauthorized_error(&mut ctx.clone(), INVALID_HEADER_VALUE))?
+        .claims;
+    let secret = ctx.get_secret(&dangerous_claim).await?;
+    let validation = ctx.get_validation().await;
+    let claim: C = decode(&token, &secret, &validation)
+        .map_err(|_err| unauthorized_error(&mut ctx.clone(), INVALID_HEADER_VALUE))?
+        .claims;
+    ctx.set_claim(claim).await;
+    next().await
 }
-
-// TODO: test this module
