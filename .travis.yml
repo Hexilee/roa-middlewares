@@ -1,0 +1,46 @@
+sudo: required
+language: rust
+
+# Cache cargo symbols for faster build
+cache: cargo
+
+rust:
+  - stable
+  - beta
+  - nightly
+
+before_cache: |
+  if [[ "$TRAVIS_RUST_VERSION" == "nightly" ]]; then
+    cargo install cargo-tarpaulin
+  fi
+
+
+before_script:
+  - export PATH=$HOME/.cargo/bin:$PATH
+
+script: # 集成脚本
+  - cargo update
+  - cargo check --all --all-features
+  - |
+    if [[ "$TRAVIS_RUST_VERSION" == "stable" || "$TRAVIS_RUST_VERSION" == "beta" ]]; then
+      cargo test --all-features --all -- --nocapture
+    fi
+
+after_success:
+  - |
+    if [[ "$TRAVIS_RUST_VERSION" == "nightly" ]]; then
+        taskset -c 0 cargo tarpaulin --out Xml --all --all-features
+        bash <(curl -s https://codecov.io/bash)
+        echo "Uploaded code coverage"
+    fi
+
+env:
+  global:
+    - TRAVIS_CARGO_NIGHTLY_FEATURE=
+
+notifications:
+  email:
+    recipients:
+    - i@hexilee.me
+  on_success: change
+  on_failure: always

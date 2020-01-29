@@ -1,0 +1,5 @@
+[![Build status](https://img.shields.io/travis/Hexilee/roa-middlewares/master.svg)](https://travis-ci.org/Hexilee/roa-middlewares)
+[![Coverage Status](https://coveralls.io/repos/github/Hexilee/roa-middlewares/badge.svg?branch=master)](https://coveralls.io/github/Hexilee/roa-middlewares?branch=master)
+[![Crate version](https://img.shields.io/crates/v/roa-middlewares.svg)](https://crates.io/crates/roa-middlewares)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Hexilee/roa-middlewares/blob/master/LICENSE)
+[![Rust Docs](https://docs.rs/roa-middlewares/badge.svg)](https://docs.rs/roa-middlewares)
