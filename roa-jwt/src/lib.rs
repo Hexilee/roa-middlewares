@@ -10,12 +10,14 @@ use serde::{de::DeserializeOwned, Serialize};
 const INVALID_HEADER_VALUE: &str = r#"Bearer realm="<jwt>", error="invalid_token""#;
 
 #[async_trait]
-pub trait JwtState<M, C>
+pub trait JwtVerifier<M, C>
 where
     M: Model,
     C: 'static + Serialize + DeserializeOwned,
 {
-    async fn get_validation(&self) -> Validation;
+    fn get_validation(&self) -> Validation {
+        Validation::default()
+    }
     async fn get_secret(&self, claim: &C) -> Result<Vec<u8>, Status>;
     async fn set_claim(&mut self, claim: C);
 }
@@ -48,17 +50,142 @@ pub async fn jwt_verify<M, C>(mut ctx: Context<M>, next: Next) -> Result<(), Sta
 where
     M: Model,
     C: 'static + Serialize + DeserializeOwned,
-    M::State: JwtState<M, C>,
+    M::State: JwtVerifier<M, C>,
 {
     let token = try_get_token(ctx.clone())?;
     let dangerous_claim: C = dangerous_unsafe_decode(&token)
         .map_err(|_err| unauthorized_error(&mut ctx.clone(), INVALID_HEADER_VALUE))?
         .claims;
     let secret = ctx.get_secret(&dangerous_claim).await?;
-    let validation = ctx.get_validation().await;
+    let validation = ctx.get_validation();
     let claim: C = decode(&token, &secret, &validation)
         .map_err(|_err| unauthorized_error(&mut ctx.clone(), INVALID_HEADER_VALUE))?
         .claims;
     ctx.set_claim(claim).await;
     next().await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{jwt_verify, JwtVerifier, async_trait, INVALID_HEADER_VALUE};
+    use jsonwebtoken::{encode, Header};
+    use roa_core::{Group, Model, Request, Status};
+    use serde::{Serialize, Deserialize};
+    use http::{StatusCode, HeaderValue};
+    use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+    use std::time::{SystemTime, Duration, UNIX_EPOCH};
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct User {
+        sub: String,
+        company: String,
+        exp: u64,
+        id: u64,
+        name: String,
+    }
+
+    struct AppModel {
+        secret: Vec<u8>
+    }
+
+    struct AppState {
+        user: Option<User>,
+        secret: Vec<u8>,
+    }
+
+    impl Model for AppModel {
+        type State = AppState;
+        fn new_state(&self) -> Self::State {
+            AppState {
+                user: None,
+                secret: self.secret.clone(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl JwtVerifier<AppModel, User> for AppState {
+        async fn get_secret(&self, _claim: &User) -> Result<Vec<u8>, Status> {
+            Ok(self.secret.clone())
+        }
+
+        async fn set_claim(&mut self, claim: User) {
+            self.user = Some(claim)
+        }
+    }
+
+    const SECRET: &[u8] = b"123456";
+
+    #[tokio::test]
+    async fn verify() -> Result<(), Box<dyn std::error::Error>> {
+        let app = Group::<AppModel>::new()
+            .handle_fn(jwt_verify)
+            .handle_fn(move |ctx, _next| {
+                async move {
+                    match ctx.user {
+                        None => panic!("ctx.usr should not be None"),
+                        Some(ref user) => {
+                            assert_eq!(0, user.id);
+                            assert_eq!("Hexilee", &user.name);
+                        }
+                    }
+                    Ok(())
+                }
+            })
+            .app(AppModel { secret: SECRET.to_vec() });
+        let addr = "127.0.0.1:8000".parse()?;
+        // no header value
+        let resp = app.serve(Request::new(), addr).await?;
+        assert_eq!(StatusCode::UNAUTHORIZED, resp.status);
+        assert_eq!(INVALID_HEADER_VALUE, resp.headers[WWW_AUTHENTICATE].to_str()?);
+
+        // non-string header value
+        let mut req = Request::new();
+        req.headers.insert(AUTHORIZATION, HeaderValue::from_bytes([255].as_ref())?);
+        let resp = app.serve(req, addr).await?;
+        assert_eq!(StatusCode::UNAUTHORIZED, resp.status);
+        assert_eq!(INVALID_HEADER_VALUE, resp.headers[WWW_AUTHENTICATE].to_str()?);
+
+        // non-Bearer header value
+        let mut req = Request::new();
+        req.headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic hahaha"));
+        let resp = app.serve(req, addr).await?;
+        assert_eq!(StatusCode::UNAUTHORIZED, resp.status);
+        assert_eq!(INVALID_HEADER_VALUE, resp.headers[WWW_AUTHENTICATE].to_str()?);
+
+        // invalid token
+        let mut req = Request::new();
+        req.headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer hahaha"));
+        let resp = app.serve(req, addr).await?;
+        assert_eq!(StatusCode::UNAUTHORIZED, resp.status);
+        assert_eq!(INVALID_HEADER_VALUE, resp.headers[WWW_AUTHENTICATE].to_str()?);
+
+
+        // expired token
+        let mut user = User {
+            sub: "user".to_string(),
+            company: "None".to_string(),
+            exp: (SystemTime::now() - Duration::from_secs(1)).duration_since(UNIX_EPOCH)?.as_secs(), // one second ago
+            id: 0,
+            name: "Hexilee".to_string(),
+        };
+        let mut req = Request::new();
+        req.headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", encode(&Header::default(), &user, SECRET)?))?,
+        );
+        let resp = app.serve(req, addr).await?;
+        assert_eq!(StatusCode::UNAUTHORIZED, resp.status);
+        assert_eq!(INVALID_HEADER_VALUE, resp.headers[WWW_AUTHENTICATE].to_str()?);
+
+        let mut req = Request::new();
+        user.exp = (SystemTime::now() + Duration::from_millis(60)).duration_since(UNIX_EPOCH)?.as_secs(); // one hour later
+        req.headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", encode(&Header::default(), &user, SECRET)?))?,
+        );
+        let resp = app.serve(req, addr).await?;
+        assert_eq!(StatusCode::OK, resp.status);
+        Ok(())
+    }
 }
